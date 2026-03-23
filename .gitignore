@@ -21,6 +21,8 @@ env/
 *~
 Thumbs.db
 .DS_Store
+.clangd/
+.clangd
 
 firmware/**/Debug/
 firmware/**/Release/
