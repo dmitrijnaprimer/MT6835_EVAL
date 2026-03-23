@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MT6835_EVAL_01-control"
+version = "0.1.1"
+description = "MT6835 evaluation lab stand control GUI part"
+dependencies = [
+"matplotlib==3.10.8",
+"numpy==2.4.1",
+"PyQt5==5.15.11",
+"PyQt5-Qt5==5.15.2",
+"PyQt5_sip==12.18.0",
+"pyserial==3.5",
+]
+
+[tool.ruff]
+
+# SETTINGS: https://docs.astral.sh/ruff/settings/
+
+line-length = 88
+indent-width = 4
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+
+# RULES: https://docs.astral.sh/ruff/rules/
+
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "S",    # security
+    "I",    # isort
+    "N",    # naming conventions
+    "D",    # docstrings
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "ICN",  # Use common import conventions
+    "TID",  # Some good import practices
+    "RET",  # Good return practices
+    "YTT",  # Ban outdated Python versions
+    "SIM",  # flake8-simplify
+    "RUF",  # Ruff-specific rules
+    "NPY",  # Some numpy-specific things
+]
+
+ignore = [
+    "D100",    # Missing docstring in public module
+    "D104",    # Missing docstring in public package
+    "D203",    # one blank line before docstring
+    "D212",    # multi-line summary start on first line
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.ruff.format]
+docstring-code-format = true
+preview = true
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+skip-magic-trailing-comma = false
