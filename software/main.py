@@ -899,6 +899,18 @@ class EncoderEvaluationGUI(QMainWindow):
                 elif key == "STATUS_HOME":
                     self.homed = val.lower() == "true"
                     self.st_homed.setText("Yes" if self.homed else "No")
+                elif key == "STATUS_MT6835_HYST":
+                    idx = int(val)
+                    if 0 <= idx <= 7 and self.hyst_combo.currentIndex() != idx:
+                        self._suppress_combo_send = True
+                        self.hyst_combo.setCurrentIndex(idx)
+                        self._suppress_combo_send = False
+                elif key == "STATUS_MT6835_BW":
+                    idx = int(val)
+                    if 0 <= idx <= 7 and self.bw_combo.currentIndex() != idx:
+                        self._suppress_combo_send = True
+                        self.bw_combo.setCurrentIndex(idx)
+                        self._suppress_combo_send = False
                 elif key == "STATUS_MT6835_USER_CAL":
                     if self.calibration_manager:
                         v = val.upper().strip()

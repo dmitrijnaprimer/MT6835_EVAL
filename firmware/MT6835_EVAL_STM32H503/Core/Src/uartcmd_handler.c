@@ -369,16 +369,24 @@ static void HandleStatusCmd(void) {
   uint32_t zero_pos_21bit = (uint32_t)zero_pos * 512u;
   uint32_t mt_physical = (mt_raw + zero_pos_21bit) & 0x1FFFFF;
 
+  uint8_t reg_0d = ENC_ReadMT6835Register(MT6835_REG_DIR_HYST);
+  uint8_t hyst_val = reg_0d & 0x07;
+  uint8_t reg_11 = ENC_ReadMT6835Register(MT6835_REG_BW);
+  uint8_t bw_val = reg_11 & 0x07;
+
   SendResponseF("STATUS_LIR-DA237T_POS:%lu,"
                 "STATUS_MT6835_POS:%lu,"
                 "STATUS_MT6835_RAW:%lu,"
                 "STATUS_MT6835_ZERO_POS:%u,"
                 "STATUS_TMC2225_EN:%s,"
                 "STATUS_MT6835_USER_CAL:%s,"
-                "STATUS_HOME:%s\n",
+                "STATUS_HOME:%s,"
+                "STATUS_MT6835_HYST:%u,"
+                "STATUS_MT6835_BW:%u\n",
                 (unsigned long)lir_raw, (unsigned long)mt_raw,
                 (unsigned long)mt_physical, (unsigned int)zero_pos,
-                motor_en ? "True" : "False", cal_str, homed ? "True" : "False");
+                motor_en ? "True" : "False", cal_str, homed ? "True" : "False",
+                (unsigned int)hyst_val, (unsigned int)bw_val);
 }
 
 /* ------------------------------------------------------------------ */
