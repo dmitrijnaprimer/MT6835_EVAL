@@ -12,8 +12,10 @@ Measures MT6835 nonlinearity against a LIR-DA237T 21/22/23-bit optical reference
 - **Motor driver:** TMC2225 (STEP/DIR, 32 microsteps)
 - **Motor:** 400 steps/rev (0.9°), 12800 microsteps/rev
 
-Single-shaft fixture — both encoders read the same shaft, motor rotates it in controlled steps for data collection. Magnet is fixed on the shaft end, tension-fitted to special adapter.
-Available are adapters for 4x2mm round, 6x2.5mm round, 6x6x6 cube neodymium magnets.
+Single-shaft fixture — both encoders are on the same shaft, stepper rotates it in discrete steps for data collection. Magnet is fixed on the shaft end, fitted to special adapter.
+Adapters are available for 4x2mm round, 6x2.5mm round, 6x6x6 cube neodymium magnets.
+
+Optimal air gap between magnet and MT6835 is 1-2mm.
 
 ## Quick Start
 
