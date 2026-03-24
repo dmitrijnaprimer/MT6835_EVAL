@@ -1,23 +1,16 @@
 """
 Visualization window for encoder linearity assessment.
 
-Side-panel layout: file list and options on the left, plots and stats
-on the right. Error plot plus optional NLC correction overlay showing
-the correction values and where they saturate.
+Side-panel layout: file list and options on the left, plot and stats on the
+right. When two datasets are checked, a second subplot shows their
+point-by-point difference (useful for before/after NLC comparisons).
 """
 
-import csv
 import glob
-import hashlib
 import os
 from typing import List
 
 import numpy as np
-
-"""Data directory: one level up from the control/ folder."""
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "data")
-NLC_DIR = os.path.join(DATA_DIR, "nlc")
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
@@ -26,7 +19,6 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QCheckBox,
     QDialog,
-    QDoubleSpinBox,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -38,6 +30,9 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "data")
+NLC_DIR = os.path.join(DATA_DIR, "nlc")
 
 PLOT_COLORS = [
     "#1f77b4",
@@ -53,12 +48,12 @@ PLOT_COLORS = [
 ]
 
 
-def _color_for_filename(filename: str) -> str:
-    h = int(hashlib.md5(filename.encode()).hexdigest(), 16)
-    return PLOT_COLORS[h % len(PLOT_COLORS)]
-
-
 def deg_to_dms_str(deg: float) -> str:
+    """Convert decimal degrees to a human-readable DMS string.
+
+    :param deg: Angle in degrees.
+    :return: String like ``12' 34.56"`` or ``5.67"``.
+    """
     sign = "-" if deg < 0 else ""
     deg = abs(deg)
     d = int(deg)
@@ -74,6 +69,11 @@ def deg_to_dms_str(deg: float) -> str:
 
 
 def deg_to_dms_tick(deg: float) -> str:
+    """Short DMS format suitable for axis tick labels.
+
+    :param deg: Angle in degrees.
+    :return: Compact string like ``3'12"`` or ``1d05'``.
+    """
     sign = "-" if deg < 0 else ""
     deg = abs(deg)
     if deg < 1 / 3600:
@@ -91,7 +91,14 @@ def deg_to_dms_tick(deg: float) -> str:
 
 
 class VisualizationWindow(QDialog):
+    """Modal dialog for plotting encoder error data from CSV files.
+
+    Supports multi-file overlay, optional de-mean, and a difference subplot
+    when exactly two datasets are selected.
+    """
+
     def __init__(self):
+        """Create the visualization window with side-panel layout."""
         super().__init__()
         self.setWindowTitle("MT6835 Non-Linearity Assessment")
         self.setGeometry(50, 50, 1400, 900)
@@ -101,7 +108,7 @@ class VisualizationWindow(QDialog):
         splitter = QSplitter(Qt.Horizontal)
         root_layout.addWidget(splitter)
 
-        # Left panel
+        # ---- Left panel: file list + options + stats ----
         left = QWidget()
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
@@ -123,28 +130,10 @@ class VisualizationWindow(QDialog):
 
         opt_group = QGroupBox("Options")
         opt_lay = QVBoxLayout(opt_group)
-        self.demean_cb = QCheckBox("De-mean (linearity only)")
+        self.demean_cb = QCheckBox("De-mean (remove DC offset)")
         self.demean_cb.setChecked(False)
         self.demean_cb.stateChanged.connect(lambda _: self._trigger_replot())
         opt_lay.addWidget(self.demean_cb)
-
-        self.show_nlc_cb = QCheckBox("Show NLC correction overlay")
-        self.show_nlc_cb.setChecked(False)
-        self.show_nlc_cb.stateChanged.connect(lambda _: self._trigger_replot())
-        opt_lay.addWidget(self.show_nlc_cb)
-
-        lsb_row = QHBoxLayout()
-        lsb_row.addWidget(QLabel("NLC LSB:"))
-        self.nlc_lsb_spin = QDoubleSpinBox()
-        self.nlc_lsb_spin.setRange(0.0005, 0.01)
-        self.nlc_lsb_spin.setDecimals(5)
-        self.nlc_lsb_spin.setSingleStep(0.0001)
-        self.nlc_lsb_spin.setValue(360.0 / (1 << 18))
-        self.nlc_lsb_spin.setSuffix("\u00b0")
-        self.nlc_lsb_spin.valueChanged.connect(lambda _: self._trigger_replot())
-        lsb_row.addWidget(self.nlc_lsb_spin)
-        opt_lay.addLayout(lsb_row)
-
         left_lay.addWidget(opt_group)
 
         stats_group = QGroupBox("Statistics")
@@ -159,7 +148,7 @@ class VisualizationWindow(QDialog):
 
         splitter.addWidget(left)
 
-        # Right panel
+        # ---- Right panel: matplotlib plot ----
         right = QWidget()
         right_lay = QVBoxLayout(right)
         right_lay.setContentsMargins(0, 0, 0, 0)
@@ -177,24 +166,21 @@ class VisualizationWindow(QDialog):
         self.replot_timer.timeout.connect(self._replot_checked)
 
     def _trigger_replot(self):
+        """Schedule a debounced replot."""
         self.replot_timer.start(100)
 
     def refresh_sources(self):
+        """Scan the data directory for CSV files and populate the file list."""
         self.file_list.blockSignals(True)
         self.file_list.clear()
-        search_paths = [
-            DATA_DIR,
-            NLC_DIR,
-        ]
         all_files = []
-        for sp in search_paths:
+        for sp in (DATA_DIR, NLC_DIR):
             for f in glob.glob(os.path.join(sp, "*.csv")):
                 all_files.append(f)
         all_files.sort(key=os.path.getmtime, reverse=True)
 
-        data_root = DATA_DIR
         for f in all_files:
-            rel = os.path.relpath(f, data_root)
+            rel = os.path.relpath(f, DATA_DIR)
             item = QListWidgetItem(rel)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
@@ -207,9 +193,11 @@ class VisualizationWindow(QDialog):
         self.file_list.blockSignals(False)
 
     def _on_check_changed(self, item):
+        """Checkbox toggled — schedule replot."""
         self.replot_timer.start(300)
 
     def _get_checked_files(self):
+        """Return list of checked filenames (relative to DATA_DIR)."""
         checked = []
         for i in range(self.file_list.count()):
             item = self.file_list.item(i)
@@ -218,6 +206,7 @@ class VisualizationWindow(QDialog):
         return checked
 
     def _replot_checked(self):
+        """Load checked CSVs, compute errors, and draw the plot."""
         filenames = self._get_checked_files()
         if not filenames:
             self.figure.clear()
@@ -225,10 +214,9 @@ class VisualizationWindow(QDialog):
             self.stats_label.setText("Check CSV files to plot.")
             return
 
-        data_root = DATA_DIR
         datasets = []
         for fn in filenames:
-            filepath = os.path.join(data_root, fn)
+            filepath = os.path.join(DATA_DIR, fn)
             try:
                 ref, meas = self._load_csv(filepath)
                 if len(ref) < 2:
@@ -243,31 +231,31 @@ class VisualizationWindow(QDialog):
             return
 
         demean = self.demean_cb.isChecked()
-        show_nlc = self.show_nlc_cb.isChecked()
-
         if demean:
             datasets = [(fn, ref, err - np.mean(err)) for fn, ref, err in datasets]
 
-        # Stats
+        # Build stats text.
         stats_lines = []
         for fn, ref, error in datasets:
             stats_lines.append(self._format_stats(error, os.path.basename(fn)))
         self.stats_label.setText("\n".join(stats_lines))
 
-        # Plot
+        # Plot.
         self.figure.clear()
-        if show_nlc:
+        show_diff = len(datasets) == 2
+
+        if show_diff:
             ax_err = self.figure.add_subplot(211)
-            ax_nlc = self.figure.add_subplot(212, sharex=ax_err)
+            ax_diff = self.figure.add_subplot(212, sharex=ax_err)
         else:
             ax_err = self.figure.add_subplot(111)
-            ax_nlc = None
+            ax_diff = None
 
         ax_err.axhline(0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
-
         max_ref = 360
-        for fn, ref, error in datasets:
-            color = _color_for_filename(os.path.basename(fn))
+
+        for idx, (fn, ref, error) in enumerate(datasets):
+            color = PLOT_COLORS[idx % len(PLOT_COLORS)]
             p2p = np.ptp(error)
             short = os.path.basename(fn)
             if len(short) > 40:
@@ -288,8 +276,8 @@ class VisualizationWindow(QDialog):
 
         ylabel = "Error (de-meaned) [deg]" if demean else "Error [deg]"
         ax_err.set_ylabel(ylabel, fontsize=10)
-        if ax_nlc is None:
-            ax_err.set_xlabel("LIR-DA237T Reference [deg]", fontsize=10)
+        if ax_diff is None:
+            ax_err.set_xlabel("LIR Reference [deg]", fontsize=10)
 
         if len(datasets) == 1:
             fn, ref, error = datasets[0]
@@ -301,6 +289,17 @@ class VisualizationWindow(QDialog):
                 f"RMS: {rms:.5f}\u00b0 = {deg_to_dms_str(rms)}",
                 fontsize=11,
             )
+        elif show_diff:
+            p2p_a = np.ptp(datasets[0][2])
+            p2p_b = np.ptp(datasets[1][2])
+            if p2p_a > 0:
+                change = ((p2p_b - p2p_a) / p2p_a) * 100
+                ax_err.set_title(
+                    f"P2P: {p2p_a:.5f}\u00b0 \u2192 {p2p_b:.5f}\u00b0 ({change:+.1f}%)",
+                    fontsize=11,
+                )
+            else:
+                ax_err.set_title("Comparison", fontsize=11)
         else:
             ax_err.set_title(f"Comparison: {len(datasets)} datasets", fontsize=11)
 
@@ -309,93 +308,93 @@ class VisualizationWindow(QDialog):
         ax_err.set_xlim(0, max_ref)
         self._add_dms_axis(ax_err)
 
-        # NLC correction overlay
-        if ax_nlc is not None:
-            nlc_lsb = self.nlc_lsb_spin.value()
-            nlc_grid = np.linspace(0, 360.0, 256, endpoint=False)
+        # Difference subplot (only for exactly 2 datasets).
+        if ax_diff is not None:
+            fn_a, ref_a, err_a = datasets[0]
+            fn_b, ref_b, err_b = datasets[1]
 
-            for fn, ref, error in datasets:
-                color = _color_for_filename(os.path.basename(fn))
-                short = os.path.basename(fn)
-                if len(short) > 30:
-                    short = short[:27] + "..."
+            # Interpolate B onto A's reference grid.
+            ref_b_ext = np.concatenate([ref_b - 360, ref_b, ref_b + 360])
+            err_b_ext = np.concatenate([err_b, err_b, err_b])
+            si = np.argsort(ref_b_ext)
+            err_b_interp = np.interp(ref_a, ref_b_ext[si], err_b_ext[si])
+            diff = err_b_interp - err_a
 
-                # De-mean for NLC computation (chip removes DC)
-                err_ac = error - np.mean(error)
+            ax_diff.axhline(0, color="black", linestyle="-", linewidth=0.5, alpha=0.5)
+            ax_diff.plot(
+                ref_a,
+                diff,
+                ".-",
+                color="#7f7f7f",
+                linewidth=0.8,
+                markersize=2,
+                alpha=0.8,
+            )
+            ax_diff.fill_between(ref_a, diff, alpha=0.15, color="#7f7f7f")
 
-                # Interpolate error onto NLC 256-point grid
-                ref_ext = np.concatenate([ref - 360, ref, ref + 360])
-                err_ext = np.concatenate([err_ac, err_ac, err_ac])
-                sort_idx = np.argsort(ref_ext)
-                err_on_grid = np.interp(nlc_grid, ref_ext[sort_idx], err_ext[sort_idx])
-
-                # Compute ideal (unclipped) and actual (clipped) correction
-                ideal_lsb = -err_on_grid / nlc_lsb
-                clipped_lsb = np.clip(np.round(ideal_lsb).astype(int), -32, 31)
-                n_sat = np.sum((clipped_lsb == -32) | (clipped_lsb == 31))
-
-                ax_nlc.plot(
-                    nlc_grid,
-                    ideal_lsb,
-                    "-",
-                    color=color,
-                    linewidth=0.6,
-                    alpha=0.4,
-                    label=f"{short} ideal",
-                )
-                ax_nlc.step(
-                    nlc_grid,
-                    clipped_lsb,
-                    "-",
-                    color=color,
-                    linewidth=1.0,
-                    alpha=0.8,
-                    where="mid",
-                    label=f"{short} clipped (sat={n_sat}/256)",
-                )
-
-            # Saturation limits
-            ax_nlc.axhline(31, color="red", linestyle="--", linewidth=0.7, alpha=0.5)
-            ax_nlc.axhline(-32, color="red", linestyle="--", linewidth=0.7, alpha=0.5)
-            ax_nlc.fill_between([0, max_ref], 31, 40, color="red", alpha=0.05)
-            ax_nlc.fill_between([0, max_ref], -32, -40, color="red", alpha=0.05)
-
-            ax_nlc.set_xlabel("Reference Angle [deg]", fontsize=10)
-            ax_nlc.set_ylabel("NLC correction [LSBs]", fontsize=10)
-            ax_nlc.set_title(
-                f"NLC correction at LSB={nlc_lsb:.5f}\u00b0  "
-                f"(range: \u00b1{32 * nlc_lsb:.4f}\u00b0)",
+            ax_diff.set_xlabel("LIR Reference [deg]", fontsize=10)
+            ax_diff.set_ylabel("Difference [deg]", fontsize=10)
+            ax_diff.set_title(
+                f"Difference (B \u2212 A)  "
+                f"Mean={np.mean(diff):+.5f}\u00b0  "
+                f"P2P={np.ptp(diff):.5f}\u00b0",
                 fontsize=10,
             )
-            ax_nlc.legend(fontsize=7)
-            ax_nlc.grid(True, linestyle=":", alpha=0.5)
-            ax_nlc.set_ylim(-40, 40)
+            ax_diff.grid(True, linestyle=":", alpha=0.5)
+            self._add_dms_axis(ax_diff)
 
         self.figure.tight_layout()
         self.canvas.draw()
 
+    # ================================================================
+    # Helpers
+    # ================================================================
+
     def _load_csv(self, filepath):
+        """Load a two-column CSV file (LIR_deg, MT_deg).
+
+        Skips comment lines (``#``) and the header row.
+
+        :param filepath: Full path to CSV.
+        :return: Tuple of (lir_array, mt_array) as numpy arrays.
+        """
         lir_values: List[float] = []
         mt_values: List[float] = []
         with open(filepath, "r") as f:
-            reader = csv.reader(f)
-            next(reader)
-            for row in reader:
-                if len(row) >= 2:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("LIR"):
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 2:
                     try:
-                        lir_values.append(float(row[0]))
-                        mt_values.append(float(row[1]))
+                        lir_values.append(float(parts[0]))
+                        mt_values.append(float(parts[1]))
                     except ValueError:
                         continue
         return np.array(lir_values), np.array(mt_values)
 
-    def _compute_error(self, ref, meas):
+    @staticmethod
+    def _compute_error(ref, meas):
+        """Compute angle error with wrap-around handling.
+
+        :param ref: Reference angles in degrees.
+        :param meas: Measured angles in degrees.
+        :return: Error array (meas - ref), wrapped to [-180, +180].
+        """
         error = meas - ref
         error[error > 180] -= 360
         error[error < -180] += 360
         return error
 
-    def _format_stats(self, error, label=""):
+    @staticmethod
+    def _format_stats(error, label=""):
+        """Format error statistics as a multi-line string.
+
+        :param error: Error array in degrees.
+        :param label: Optional label prefix.
+        :return: Formatted string.
+        """
         p2p = np.ptp(error)
         rms = np.sqrt(np.mean(error**2))
         mean_err = np.mean(error)
@@ -406,7 +405,13 @@ class VisualizationWindow(QDialog):
             f"  RMS={rms:.5f}\u00b0  Mean={mean_err:+.5f}\u00b0\n"
         )
 
-    def _add_dms_axis(self, ax):
+    @staticmethod
+    def _add_dms_axis(ax):
+        """Add a secondary Y-axis with DMS-formatted tick labels.
+
+        :param ax: Matplotlib axes to add the twin axis to.
+        """
+
         def fmt_deg(x, pos):
             if abs(x) < 0.001:
                 return f"{x:.5f}"

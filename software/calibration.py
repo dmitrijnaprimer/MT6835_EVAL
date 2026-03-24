@@ -1,11 +1,18 @@
 """
-MT6835 Calibration Manager for NLC and User Auto-Calibration.
+MT6835 calibration manager for NLC and user auto-calibration.
 
-NLC encoding (confirmed):
+Handles two calibration workflows:
+- User auto-calibration: spins the motor, enables CAL_EN, polls until done.
+- Stepped data collection: moves the shaft in discrete steps, collects
+  LIR + MT6835 angle pairs at each position.
+
+Also provides NLC table generation from collected data.
+
+NLC encoding (confirmed by testing):
   - 256 entries, 6-bit two's complement (-32 to +31)
   - Packed MSB-first: AAAAAABB BBBBCCCC CCDDDDDD
   - Indexed by raw magnetic angle (before ZERO_POS subtraction)
-  - 1 NLC LSB = 360 / 2^18 = 0.001373 deg (nominal, under investigation)
+  - 1 NLC LSB = 360 / 2^18 = 0.001373 deg
   - Chip internally removes the DC component of the table
 """
 
@@ -13,24 +20,32 @@ import datetime
 import glob
 import os
 import time
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional
 
 import numpy as np
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
-"""Data directory: one level up from the control/ folder."""
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "data")
 NLC_DIR = os.path.join(DATA_DIR, "nlc")
 
 
 class CalibrationManager(QObject):
-    """Orchestrates MT6835 calibration workflows and data collection."""
+    """Orchestrates MT6835 calibration workflows and data collection.
+
+    :param serial_sender: Callable that sends a command string to the board.
+    :param console_updater: Callable that logs a message to the GUI console.
+    """
 
     calibration_progress = pyqtSignal(int, str)
+    """Signal(percent, cal_type): emitted during collection to update progress bars."""
+
     calibration_status = pyqtSignal(str)
+    """Signal(message): emitted for status text updates."""
+
     calibration_finished = pyqtSignal(bool, str)
+    """Signal(success, cal_type): emitted when a calibration or collection completes."""
 
     NLC_POINTS = 256
     NLC_BYTES = 192
@@ -38,6 +53,11 @@ class CalibrationManager(QObject):
     USTEPS_PER_REV = 12800
 
     def __init__(self, serial_sender: Callable, console_updater: Callable):
+        """Initialize the calibration manager.
+
+        :param serial_sender: Function to send a UART command string.
+        :param console_updater: Function to append a line to the console.
+        """
         super().__init__()
         self.serial_sender = serial_sender
         self.console_updater = console_updater
@@ -58,6 +78,7 @@ class CalibrationManager(QObject):
         self.state = "IDLE"
         self.wait_counter = 0
         self.sample_interval_counter = 0
+        self.skip_first_point = False
 
         self.data_lir: List[float] = []
         self.data_mt: List[float] = []
@@ -78,6 +99,10 @@ class CalibrationManager(QObject):
     # ================================================================
 
     def start_user_calibration(self, rpm: int = 60):
+        """Start the MT6835 internal auto-calibration procedure.
+
+        :param rpm: Motor speed for calibration (25-200 RPM).
+        """
         if self.calibration_in_progress:
             return
         self.calibration_in_progress = True
@@ -101,6 +126,7 @@ class CalibrationManager(QObject):
             self.cancel_calibration()
 
     def _check_user_cal_status(self):
+        """Timer callback: poll STATUS to check auto-cal progress."""
         if not self.calibration_in_progress:
             return
         self.serial_sender("STATUS")
@@ -110,9 +136,11 @@ class CalibrationManager(QObject):
             self.cancel_calibration()
 
     def handle_user_cal_running(self):
+        """Called when STATUS reports USER_CAL = Running."""
         self.console_updater("User Cal: Running...")
 
     def handle_user_cal_success(self):
+        """Called when STATUS reports USER_CAL = OK."""
         self.user_cal_timer.stop()
         self.console_updater("User Cal: SUCCESS! Waiting 6.5s for EEPROM...")
         for _ in range(65):
@@ -126,10 +154,12 @@ class CalibrationManager(QObject):
         self.calibration_type = None
 
     def handle_user_cal_error(self):
+        """Called when STATUS reports USER_CAL = Failed."""
         self.console_updater("User Cal: FAILED!")
         self.cancel_calibration()
 
     def cancel_calibration(self):
+        """Abort any running calibration or collection. Stops motor."""
         if self.calibration_in_progress:
             self.console_updater("Cancelling...")
             self.user_cal_timer.stop()
@@ -145,7 +175,10 @@ class CalibrationManager(QObject):
     # ================================================================
 
     def start_data_collection(self, points: int):
-        """Collect measurement points for analysis or NLC generation."""
+        """Begin a stepped data collection across one full revolution.
+
+        :param points: Number of measurement positions (e.g. 256).
+        """
         if self.calibration_in_progress:
             return
         self.calibration_in_progress = True
@@ -154,6 +187,7 @@ class CalibrationManager(QObject):
         self._start_stepped_process()
 
     def _start_stepped_process(self):
+        """Read ZERO_POS, then start the collection state machine."""
         est_sec = self.target_points * (
             self.SETTLE_TIME_MS / 1000.0
             + self.SAMPLES_PER_POINT * self.SAMPLE_INTERVAL_MS / 1000.0
@@ -165,17 +199,23 @@ class CalibrationManager(QObject):
         QTimer.singleShot(200, self._read_zero_pos)
 
     def _read_zero_pos(self):
+        """Request ZERO_POS from the chip."""
         self.serial_sender("MT6835_READ_ZERO")
         time.sleep(0.3)
         QTimer.singleShot(500, self._configure_stepped_move)
 
     def handle_zero_pos_response(self, zero_pos_raw: int):
+        """Store the ZERO_POS value received from the board.
+
+        :param zero_pos_raw: 12-bit ZERO_POS register value (0-4095).
+        """
         self.zero_pos_raw = zero_pos_raw
         self.console_updater(
             f"ZERO_POS={zero_pos_raw} ({zero_pos_raw * 360.0 / 4096:.2f} deg)"
         )
 
     def _configure_stepped_move(self):
+        """Configure motor and start the collection state machine."""
         self.steps_per_segment = self.USTEPS_PER_REV // self.target_points
         self.console_updater(f"Config: 1 RPM, {self.steps_per_segment} usteps/segment")
         self.serial_sender("SET_SPEED 1")
@@ -192,12 +232,13 @@ class CalibrationManager(QObject):
         self.temp_mt_samples = []
         self.wait_counter = 0
         self.sample_interval_counter = 0
-        self.skip_first_point = True  # discard first point (no motor approach)
+        self.skip_first_point = True
         self.state = "SETTLE"
         self.console_updater("Collecting...")
         self.step_timer.start(50)
 
     def _step_process_logic(self):
+        """50ms timer callback driving the collection state machine."""
         if not self.calibration_in_progress:
             return
 
@@ -246,11 +287,10 @@ class CalibrationManager(QObject):
                 self.state = "SAMPLE_WAIT"
 
     def _store_point(self):
+        """Compute median of samples and store. Discards first point."""
         avg_lir = float(np.median(self.temp_lir_samples))
         avg_mt = float(np.median(self.temp_mt_samples))
 
-        # Discard the first point — collected at starting position before
-        # any stepped approach, often contains stale/transient readings.
         if self.skip_first_point:
             self.skip_first_point = False
             self.temp_lir_samples = []
@@ -271,32 +311,38 @@ class CalibrationManager(QObject):
         self.state = "MOVE"
 
     def record_nlc_data_point(self, lir_deg: float, mt_deg: float):
+        """Called by the GUI when a STATUS response contains both encoder angles.
+
+        :param lir_deg: LIR angle in degrees.
+        :param mt_deg: MT6835 angle in degrees.
+        """
         if self.calibration_in_progress and self.state == "SAMPLE_RECEIVE":
-            if self.calibration_type in ["nlc", "collect"]:
+            if self.calibration_type in ("nlc", "collect"):
                 self.temp_lir_samples.append(lir_deg)
                 self.temp_mt_samples.append(mt_deg)
                 self.state = "CHECK_COMPLETE"
 
     def _finish_stepped_process(self):
+        """Stop motor, save CSV with ZERO_POS header, emit completion."""
         self.step_timer.stop()
         self.serial_sender("STOP_MOTOR")
         self.console_updater(f"Done. {len(self.data_lir)} points collected.")
 
-        data_dir = DATA_DIR
-        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(DATA_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         csv_name = f"collected_data_{ts}.csv"
 
         try:
-            csv_path = os.path.join(data_dir, csv_name)
+            csv_path = os.path.join(DATA_DIR, csv_name)
             with open(csv_path, "w") as f:
+                f.write(f"# ZERO_POS={self.zero_pos_raw}\n")
                 f.write("LIR_deg,MT_deg\n")
                 for l_val, m_val in zip(self.data_lir, self.data_mt):
                     f.write(f"{l_val:.6f},{m_val:.6f}\n")
             self.console_updater(f"Saved: {csv_name}")
             self.calibration_finished.emit(True, self.calibration_type)
         except Exception as e:
-            self.console_updater(f"Error: {e}")
+            self.console_updater(f"Error saving: {e}")
             self.calibration_finished.emit(False, self.calibration_type)
         finally:
             self.calibration_in_progress = False
@@ -308,18 +354,13 @@ class CalibrationManager(QObject):
     # ================================================================
 
     def generate_nlc_from_last_collection(self):
-        """Compute an NLC table from the most recent data_lir/data_mt arrays.
-
-        Called from the 'Generate NLC' button. Uses the last collected data
-        without requiring a new collection.
-        """
+        """Compute an NLC correction table from the last collected data."""
         if not self.data_lir or not self.data_mt:
             self.console_updater("No data to generate NLC from.")
             return
 
         ref = np.array(self.data_lir)
         meas = np.array(self.data_mt)
-
         error = meas - ref
         error[error > 180] -= 360
         error[error < -180] += 360
@@ -331,7 +372,6 @@ class CalibrationManager(QObject):
             f"Mean={np.mean(error):+.5f} deg"
         )
 
-        # Map NLC grid to user angle space via ZERO_POS.
         zero_pos_deg = self.zero_pos_raw * 360.0 / 4096.0
         nlc_raw_angles = np.linspace(0, 360.0, 256, endpoint=False)
         nlc_user_angles = (nlc_raw_angles - zero_pos_deg) % 360.0
@@ -340,14 +380,12 @@ class CalibrationManager(QObject):
         err_ext = np.concatenate([error, error, error])
         sort_idx = np.argsort(ref_ext)
         error_at_nlc = np.interp(nlc_user_angles, ref_ext[sort_idx], err_ext[sort_idx])
-
-        # Remove DC — chip does this internally.
         error_ac = error_at_nlc - np.mean(error_at_nlc)
 
         correction_lsb = -error_ac / self.NLC_LSB_DEGREES
         nlc_signed = np.clip(np.round(correction_lsb).astype(int), -32, 31)
 
-        n_sat = np.sum((nlc_signed == -32) | (nlc_signed == 31))
+        n_sat = int(np.sum((nlc_signed == -32) | (nlc_signed == 31)))
         chip_corr = (nlc_signed - np.mean(nlc_signed)) * self.NLC_LSB_DEGREES
         residual = error_ac + chip_corr
 
@@ -358,13 +396,11 @@ class CalibrationManager(QObject):
             f"({(1 - np.ptp(residual) / np.ptp(error_ac)) * 100:.0f}% reduction)"
         )
 
-        # Save hex file
         hex_data = self._pack_nlc_msb_first(nlc_signed).hex().upper()
-        nlc_dir = NLC_DIR
-        os.makedirs(nlc_dir, exist_ok=True)
+        os.makedirs(NLC_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"nlc_table_{ts}.hex"
-        with open(os.path.join(nlc_dir, fname), "w") as f:
+        with open(os.path.join(NLC_DIR, fname), "w") as f:
             f.write(hex_data)
 
         self.latest_hex_table = hex_data
@@ -376,14 +412,22 @@ class CalibrationManager(QObject):
     # ================================================================
 
     def get_available_nlc_hex_files(self):
-        nlc_dir = NLC_DIR
-        if not os.path.isdir(nlc_dir):
+        """Return list of .hex filenames in the NLC data directory.
+
+        :return: Filenames sorted by modification time, most recent first.
+        """
+        if not os.path.isdir(NLC_DIR):
             return []
-        files = glob.glob(os.path.join(nlc_dir, "*.hex"))
+        files = glob.glob(os.path.join(NLC_DIR, "*.hex"))
         files.sort(key=os.path.getmtime, reverse=True)
         return [os.path.basename(f) for f in files]
 
     def load_nlc_hex_file(self, filename):
+        """Load a hex string from a .hex file.
+
+        :param filename: Filename (not full path).
+        :return: 384-character uppercase hex string.
+        """
         filepath = os.path.join(NLC_DIR, filename)
         with open(filepath, "r") as f:
             return f.read().strip()
@@ -392,7 +436,13 @@ class CalibrationManager(QObject):
     # NLC packing — MSB-first: AAAAAABB BBBBCCCC CCDDDDDD
     # ================================================================
 
-    def _pack_nlc_msb_first(self, values: np.ndarray) -> bytearray:
+    @staticmethod
+    def _pack_nlc_msb_first(values: np.ndarray) -> bytearray:
+        """Pack 256 signed 6-bit values into 192 bytes (MSB-first).
+
+        :param values: Array of 256 integers in range [-32, 31].
+        :return: 192-byte packed table.
+        """
         packed = bytearray()
         for i in range(0, 256, 4):
             v = [int(values[i + j]) & 0x3F for j in range(4)]
