@@ -1,5 +1,8 @@
-"""
-Encoder evaluation GUI for MT6835 motor control.
+"""Encoder evaluation GUI for MT6835 motor control.
+
+Provides serial communication with the eval board, motor control,
+MT6835 configuration (HYST, BW, NLC, ZERO_POS), stepped data
+collection, and a visualization window.
 """
 
 import sys
@@ -50,30 +53,42 @@ DEG_PER_USTEP = 360.0 / USTEPS_PER_REV
 """Movement presets: (label, microsteps). All are exact multiples of one microstep."""
 MOVE_PRESETS = [
     ("Continuous", 0),
-    ("0.028\u00b0 (1 \u00b5st)", 1),
-    ("0.113\u00b0 (4 \u00b5st)", 4),
-    ("0.225\u00b0 (8 \u00b5st)", 8),
-    ("0.450\u00b0 (16 \u00b5st)", 16),
-    ("0.900\u00b0 (32 \u00b5st)", 32),
-    ("1.406\u00b0 (50 \u00b5st)", 50),
-    ("1.800\u00b0 (64 \u00b5st)", 64),
-    ("2.813\u00b0 (100 \u00b5st)", 100),
-    ("5.625\u00b0 (200 \u00b5st)", 200),
-    ("11.25\u00b0 (400 \u00b5st)", 400),
-    ("22.50\u00b0 (800 \u00b5st)", 800),
-    ("45.00\u00b0 (1600 \u00b5st)", 1600),
-    ("90.00\u00b0 (3200 \u00b5st)", 3200),
-    ("180.0\u00b0 (6400 \u00b5st)", 6400),
-    ("360.0\u00b0 (12800 \u00b5st)", 12800),
+    ("0.028° (1 µst)", 1),
+    ("0.113° (4 µst)", 4),
+    ("0.225° (8 µst)", 8),
+    ("0.450° (16 µst)", 16),
+    ("0.900° (32 µst)", 32),
+    ("1.406° (50 µst)", 50),
+    ("1.800° (64 µst)", 64),
+    ("2.813° (100 µst)", 100),
+    ("5.625° (200 µst)", 200),
+    ("11.25° (400 µst)", 400),
+    ("22.50° (800 µst)", 800),
+    ("45.00° (1600 µst)", 1600),
+    ("90.00° (3200 µst)", 3200),
+    ("180.0° (6400 µst)", 6400),
+    ("360.0° (12800 µst)", 12800),
 ]
 
 
 class SerialReader(QThread):
+    """Background thread for reading UART data line-by-line.
+
+    Emits ``data_received(str)`` for each complete line,
+    ``connection_status_changed(bool)`` on connect/disconnect,
+    and ``error_occurred(str)`` on errors.
+    """
+
     data_received = pyqtSignal(str)
     connection_status_changed = pyqtSignal(bool)
     error_occurred = pyqtSignal(str)
 
     def __init__(self, port_name, baudrate=115200):
+        """Open a serial reader on the given port.
+
+        :param port_name: COM port string (e.g. ``COM3``).
+        :param baudrate: Baud rate (default 115200).
+        """
         super().__init__()
         self.port_name = port_name
         self.baudrate = baudrate
@@ -82,6 +97,7 @@ class SerialReader(QThread):
         self.buffer = ""
 
     def run(self):
+        """Thread entry point. Opens port and reads until stopped."""
         try:
             self.serial_port = serial.Serial(
                 self.port_name,
@@ -118,6 +134,7 @@ class SerialReader(QThread):
             self.connection_status_changed.emit(False)
 
     def stop(self):
+        """Signal the thread to stop and close the serial port."""
         self.running = False
         if self.serial_port and self.serial_port.is_open:
             try:
@@ -129,6 +146,7 @@ class SerialReader(QThread):
 
 
 def _btn(text, callback, width=BTN_WIDTH):
+    """Create a fixed-width QPushButton connected to a callback."""
     b = QPushButton(text)
     b.setFixedWidth(width)
     b.clicked.connect(callback)
@@ -136,22 +154,29 @@ def _btn(text, callback, width=BTN_WIDTH):
 
 
 def _get_int(combo):
+    """Extract the leading integer from a combo box text like ``50 RPM``."""
     return int(combo.currentText().split()[0])
 
 
 class EncoderEvaluationGUI(QMainWindow):
+    """Main application window for MT6835 encoder evaluation.
+
+    Manages serial connection, motor control, MT6835 register access,
+    data collection, NLC table upload, and visualization.
+    """
+
     MT6835_BITS = 21
     MT6835_COUNTS = 2**21
 
     HYST_LABELS = [
-        "HYST 0.022\u00b0",
-        "HYST 0.044\u00b0",
-        "HYST 0.088\u00b0",
-        "HYST 0.176\u00b0",
+        "HYST 0.022°",
+        "HYST 0.044°",
+        "HYST 0.088°",
+        "HYST 0.176°",
         "HYST OFF",
-        "HYST 0.003\u00b0",
-        "HYST 0.006\u00b0",
-        "HYST 0.011\u00b0",
+        "HYST 0.003°",
+        "HYST 0.006°",
+        "HYST 0.011°",
     ]
 
     BW_LABELS = [
@@ -193,6 +218,7 @@ class EncoderEvaluationGUI(QMainWindow):
     # ================================================================
 
     def _build_ui(self):
+        """Assemble the main window layout from group boxes."""
         c = QWidget()
         self.setCentralWidget(c)
         root = QVBoxLayout(c)
@@ -224,13 +250,9 @@ class EncoderEvaluationGUI(QMainWindow):
     def _build_status(self):
         g = QGroupBox("Status")
         lay = QGridLayout(g)
-        lay.setSpacing(4)
+        lay.setSpacing(2)
         lay.setColumnStretch(1, 1)
         lay.setColumnStretch(3, 1)
-        lay.setColumnMinimumWidth(0, 80)
-        lay.setColumnMinimumWidth(2, 110)
-        lay.setHorizontalSpacing(10)
-        lay.setVerticalSpacing(4)
         self.st_comms = QLabel("Disconnected")
         self.st_homed = QLabel("No")
         self.st_tmc = QLabel("---")
@@ -335,7 +357,7 @@ class EncoderEvaluationGUI(QMainWindow):
         lay.addWidget(self.ucal_btn, 0, 2)
         lay.addWidget(self.mt_progress, 0, 3)
 
-        # HYST and BW — same width as other controls
+        # HYST and BW
         self.hyst_combo = QComboBox()
         self.hyst_combo.setFixedWidth(BTN_WIDTH)
         self.hyst_combo.addItems(self.HYST_LABELS)
@@ -348,20 +370,19 @@ class EncoderEvaluationGUI(QMainWindow):
         self.bw_combo.setCurrentIndex(5)
         self.bw_combo.currentIndexChanged.connect(self._on_bw_changed)
 
-        lay.addWidget(self.hyst_combo, 1, 0)
-        lay.addWidget(self.bw_combo, 1, 1)
-
         self.nlc_upload_btn = _btn("Upload NLC", self._on_nlc_upload)
         self.nlc_en_btn = _btn("Enable NLC", lambda: self._send("MT6835_ENABLE_NLC"))
         self.nlc_dis_btn = _btn("Disable NLC", lambda: self._send("MT6835_DISABLE_NLC"))
         self.nlc_clear_btn = _btn("Clear NLC", self._on_nlc_clear)
+        self.nlc_prog_btn = _btn("Program EEPROM", self._on_program_eeprom)
+        self.read_regs_btn = _btn("Read Registers", self._on_read_registers)
+
+        lay.addWidget(self.hyst_combo, 1, 0)
+        lay.addWidget(self.bw_combo, 1, 1)
         lay.addWidget(self.nlc_upload_btn, 1, 2)
         lay.addWidget(self.nlc_en_btn, 1, 3)
         lay.addWidget(self.nlc_dis_btn, 2, 0)
         lay.addWidget(self.nlc_clear_btn, 2, 1)
-
-        self.nlc_prog_btn = _btn("Program EEPROM", self._on_program_eeprom)
-        self.read_regs_btn = _btn("Read Registers", self._on_read_registers)
         lay.addWidget(self.nlc_prog_btn, 2, 2)
         lay.addWidget(self.read_regs_btn, 2, 3)
         return g
@@ -531,6 +552,7 @@ class EncoderEvaluationGUI(QMainWindow):
     # ================================================================
 
     def _send(self, cmd):
+        """Send a command string over UART. Logs unless suppressed."""
         if not (
             self.serial_reader_thread
             and self.serial_reader_thread.isRunning()
@@ -740,14 +762,14 @@ class EncoderEvaluationGUI(QMainWindow):
     # ================================================================
 
     HYST_DECODE = {
-        0: "0.022\u00b0",
-        1: "0.044\u00b0",
-        2: "0.088\u00b0",
-        3: "0.176\u00b0",
+        0: "0.022°",
+        1: "0.044°",
+        2: "0.088°",
+        3: "0.176°",
         4: "OFF",
-        5: "0.003\u00b0",
-        6: "0.006\u00b0",
-        7: "0.011\u00b0",
+        5: "0.003°",
+        6: "0.006°",
+        7: "0.011°",
     }
     BW_DECODE = {
         0: "Baseline",
@@ -761,6 +783,7 @@ class EncoderEvaluationGUI(QMainWindow):
     }
 
     def _handle_serial_data(self, text):
+        """Route incoming serial lines to the appropriate handler."""
         text = text.strip()
         if not text:
             return
@@ -821,7 +844,7 @@ class EncoderEvaluationGUI(QMainWindow):
         self._log(f"< {text}" if text.startswith(("OK:", "ERR:", "INFO:")) else text)
 
     def _decode_register_dump(self, raw):
-        """Parse and display MT6835 registers in a human-readable format."""
+        """Parse MT6835 register dump and display with human-readable decode. and display MT6835 registers in a human-readable format."""
         regs = {}
         for pair in raw.split(","):
             if "=" in pair:
@@ -843,7 +866,7 @@ class EncoderEvaluationGUI(QMainWindow):
                 zp_high = val
                 zp_low = regs.get(0x00A, 0)
                 zp = (zp_high << 4) | ((zp_low >> 4) & 0x0F)
-                decode = f"ZERO_POS={zp} ({zp * 360.0 / 4096:.3f}\u00b0)"
+                decode = f"ZERO_POS={zp} ({zp * 360.0 / 4096:.3f}°)"
             elif addr == 0x00A:
                 z_edge = (val >> 3) & 1
                 z_wid = val & 0x07
@@ -870,6 +893,7 @@ class EncoderEvaluationGUI(QMainWindow):
             self._log(line)
 
     def _parse_status(self, text):
+        """Parse a STATUS response and update all GUI fields."""
         try:
             lir_deg = mt_deg = None
             for part in text.split(","):
@@ -881,18 +905,18 @@ class EncoderEvaluationGUI(QMainWindow):
                 if key == "STATUS_LIR-DA237T_POS":
                     self.last_lir_raw = int(val)
                     lir_deg = (self.last_lir_raw / (2**LIR_BIT_DEPTH)) * 360.0
-                    self.st_lir_pos.setText(f"{lir_deg:.6f}\u00b0")
+                    self.st_lir_pos.setText(f"{lir_deg:.6f}°")
                 elif key == "STATUS_MT6835_POS":
                     self.last_mt_raw = int(val)
                     mt_deg = (self.last_mt_raw / self.MT6835_COUNTS) * 360.0
-                    self.st_mt_pos.setText(f"{mt_deg:.6f}\u00b0  ({self.last_mt_raw})")
+                    self.st_mt_pos.setText(f"{mt_deg:.6f}°  ({self.last_mt_raw})")
                 elif key == "STATUS_MT6835_RAW":
                     raw_val = int(val)
                     raw_deg = (raw_val / self.MT6835_COUNTS) * 360.0
-                    self.st_mt_raw.setText(f"{raw_deg:.6f}\u00b0  ({raw_val})")
+                    self.st_mt_raw.setText(f"{raw_deg:.6f}°  ({raw_val})")
                 elif key == "STATUS_MT6835_ZERO_POS":
                     zp = int(val)
-                    self.st_mt_zero.setText(f"{zp * 360.0 / 4096:.3f}\u00b0  ({zp})")
+                    self.st_mt_zero.setText(f"{zp * 360.0 / 4096:.3f}°  ({zp})")
                 elif key == "STATUS_TMC2225_EN":
                     self.tmc_enabled = val.lower() == "true"
                     self.st_tmc.setText("Enabled" if self.tmc_enabled else "Disabled")
@@ -927,6 +951,7 @@ class EncoderEvaluationGUI(QMainWindow):
             self._log(f"Parse error: {e}")
 
     def keyPressEvent(self, event):
+        """Handle Up/Down arrow keys for command history."""
         if event.key() == 16777235 and self.history_index > 0:
             self.history_index -= 1
             self.cmd_input.setText(self.command_history[self.history_index])
@@ -942,6 +967,7 @@ class EncoderEvaluationGUI(QMainWindow):
 
 
 def main():
+    """Application entry point."""
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = EncoderEvaluationGUI()

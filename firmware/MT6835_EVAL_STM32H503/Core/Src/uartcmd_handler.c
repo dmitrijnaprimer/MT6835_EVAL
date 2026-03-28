@@ -3,7 +3,9 @@
  * @brief UART command processor for MT6835 evaluation board.
  *
  * Parses newline-terminated ASCII commands from the host PC and dispatches
- * them to the appropriate encoder, motor, or calibration handler.
+ * them to the appropriate encoder, motor, or calibration handler. Responses
+ * are sent back as single-line ASCII strings prefixed with OK:, ERR:, INFO:,
+ * or STATUS_ for structured telemetry.
  */
 
 #include "uartcmd_handler.h"
@@ -19,14 +21,26 @@
 
 extern UART_HandleTypeDef huart1;
 
+/** @brief Target RPM stored by SET_SPEED, used by MOVE_CW/CCW commands. */
 static int stored_target_rpm = 0;
+
+/** @brief Target step count stored by SET_STEPS, used by MOVE_CW/CCW_STEPS. */
 static int32_t stored_target_steps = 0;
+
+/** @brief True after a successful HOME command. Cleared on any motor movement.
+ */
 bool homed = false;
 
+/* ------------------------------------------------------------------ */
+/* UART helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+/** @brief Send a null-terminated string over UART1. */
 static void SendResponse(const char *msg) {
   HAL_UART_Transmit(&huart1, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
 }
 
+/** @brief Send a printf-formatted string over UART1 (max 300 chars). */
 static void SendResponseF(const char *fmt, ...) {
   char buf[300];
   va_list args;
@@ -36,7 +50,10 @@ static void SendResponseF(const char *fmt, ...) {
   SendResponse(buf);
 }
 
-/* Forward declarations */
+/* ------------------------------------------------------------------ */
+/* Forward declarations                                               */
+/* ------------------------------------------------------------------ */
+
 static void HandleSetSpeedCmd(char *param);
 static void HandleSetStepsCmd(char *param);
 static void HandleMoveCWCmd(void);
@@ -59,9 +76,15 @@ static void HandleMT6835ClearNLCCmd(void);
 static void HandleMT6835EnableNLCCmd(void);
 static void HandleMT6835DisableNLCCmd(void);
 static void HandleMT6835ProgramEEPROMCmd(void);
-static void HandleMT6835SetHystCmd(char *param);
-static void HandleMT6835SetBWCmd(char *param);
 
+/* ------------------------------------------------------------------ */
+/* Command dispatcher                                                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Parse and execute a single command string.
+ * @param cmd_str Null-terminated command (will be modified by strtok).
+ */
 void UART_CMD_ProcessCommand(char *cmd_str) {
   char *token = strtok(cmd_str, " \r\n");
   if (!token)
@@ -115,8 +138,7 @@ void UART_CMD_ProcessCommand(char *cmd_str) {
       HandleLoadNLCCmd(token);
   } else if (strcmp(token, "MT6835_READ_ZERO") == 0) {
     uint16_t zp = ENC_GetMT6835ZeroPos();
-    SendResponseF("OK:ZERO_POS=%u (%.3f deg)\n", zp,
-                  (float)zp * 360.0f / 4096.0f);
+    SendResponseF("OK:ZERO_POS=%u\n", zp);
   } else if (strcmp(token, "MT6835_NLC_DUMP") == 0) {
     char buf[400];
     ENC_ReadNLCTable(buf, sizeof(buf));
@@ -131,16 +153,34 @@ void UART_CMD_ProcessCommand(char *cmd_str) {
     HandleMT6835EnableNLCCmd();
   } else if (strcmp(token, "MT6835_DISABLE_NLC") == 0) {
     HandleMT6835DisableNLCCmd();
-  } else if (strcmp(token, "MT6835_PROGRAM_EEPROM") == 0) {
-    HandleMT6835ProgramEEPROMCmd();
   } else if (strcmp(token, "MT6835_SET_HYST") == 0) {
     token = strtok(NULL, " \r\n");
-    if (token)
-      HandleMT6835SetHystCmd(token);
+    if (token) {
+      int val = atoi(token);
+      if (val >= 0 && val <= 7) {
+        uint8_t reg = ENC_ReadMT6835Register(MT6835_REG_DIR_HYST);
+        reg = (reg & 0xF8) | (val & 0x07);
+        ENC_WriteMT6835Register(MT6835_REG_DIR_HYST, reg);
+        SendResponseF("OK:HYST=%d (reg=0x%02X)\n", val, reg);
+      } else {
+        SendResponse("ERR:HYST 0-7 only\n");
+      }
+    }
   } else if (strcmp(token, "MT6835_SET_BW") == 0) {
     token = strtok(NULL, " \r\n");
-    if (token)
-      HandleMT6835SetBWCmd(token);
+    if (token) {
+      int val = atoi(token);
+      if (val >= 0 && val <= 7) {
+        uint8_t reg = ENC_ReadMT6835Register(MT6835_REG_BW);
+        reg = (reg & 0xF8) | (val & 0x07);
+        ENC_WriteMT6835Register(MT6835_REG_BW, reg);
+        SendResponseF("OK:BW=%d (reg=0x%02X)\n", val, reg);
+      } else {
+        SendResponse("ERR:BW 0-7 only\n");
+      }
+    }
+  } else if (strcmp(token, "MT6835_PROGRAM_EEPROM") == 0) {
+    HandleMT6835ProgramEEPROMCmd();
   } else if (strcmp(token, "TMC2225_MS_4") == 0) {
     HAL_GPIO_WritePin(TMC2225_MICROSTEPS_GPIO_Port, TMC2225_MICROSTEPS_Pin,
                       GPIO_PIN_RESET);
@@ -154,6 +194,14 @@ void UART_CMD_ProcessCommand(char *cmd_str) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Motor helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * @brief Block until the current step-move completes or timeout expires.
+ * @param timeout_ms Maximum wait time in milliseconds.
+ */
 static void WaitForMoveComplete(uint32_t timeout_ms) {
   uint32_t start = HAL_GetTick();
   while (!MC_IsStepMoveComplete()) {
@@ -164,9 +212,19 @@ static void WaitForMoveComplete(uint32_t timeout_ms) {
 }
 
 /* ------------------------------------------------------------------ */
-/* HOME                                                               */
+/* HOME — move shaft to LIR absolute zero position                    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief Move the shaft to the LIR-DA237T absolute zero position.
+ *
+ * Uses a coarse-then-fine approach: reads the LIR absolute position, calculates
+ * direction and distance to raw position zero, moves there, and sets the LIR
+ * software offset so subsequent reads start from 0 degrees.
+ *
+ * Does NOT change the MT6835 ZERO_POS register. Use SET_ZERO_MT6835 separately
+ * during commissioning — changing ZERO_POS invalidates the NLC table alignment.
+ */
 static void HandleHomeCmd(void) {
   HAL_GPIO_WritePin(TMC2225_EN_GPIO_Port, TMC2225_EN_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(TMC2225_MICROSTEPS_GPIO_Port, TMC2225_MICROSTEPS_Pin,
@@ -177,10 +235,15 @@ static void HandleHomeCmd(void) {
   uint32_t max_counts = 1UL << bits;
   int32_t half_counts = (int32_t)(max_counts / 2);
 
+  /* Reset LIR offset to read absolute physical position. */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
-  uint32_t pos0 = ENC_ReadLIRRaw();
 
+  uint32_t pos0 = ENC_ReadLIRRaw();
+  SendResponseF("INFO:LIR abs pos=%u/%u\n", (unsigned int)pos0,
+                (unsigned int)max_counts);
+
+  /* Move 200 microsteps CW to determine direction mapping. */
   MC_SetTargetRPM(5);
   MC_MoveSteps(200, true);
   WaitForMoveComplete(5000);
@@ -203,6 +266,7 @@ static void HandleHomeCmd(void) {
     return;
   }
 
+  /* Coarse move to LIR raw zero. */
   int32_t to_zero = -(int32_t)pos1;
   if (to_zero > half_counts)
     to_zero -= (int32_t)max_counts;
@@ -220,6 +284,7 @@ static void HandleHomeCmd(void) {
     HAL_Delay(500);
   }
 
+  /* Fine correction pass. */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
   uint32_t pos2 = ENC_ReadLIRRaw();
@@ -241,23 +306,26 @@ static void HandleHomeCmd(void) {
     HAL_Delay(500);
   }
 
+  /* Set LIR software zero at this position. MT6835 zero is NOT touched. */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
+  /* Read final positions. LIR reports true physical position (no software
+   * offset). */
   ENC_ReadLIRRaw();
-  ENC_SetLIRZero();
   homed = true;
 
   uint32_t lir_final = ENC_ReadLIRRaw();
   uint32_t mt_final = ENC_ReadMT6835Raw();
 
-  SendResponseF("OK:Homed LIR=%lu MT=%lu\n", (unsigned long)lir_final,
-                (unsigned long)mt_final);
+  SendResponseF("OK:Homed LIR=%u MT=%u\n", (unsigned int)lir_final,
+                (unsigned int)mt_final);
 }
 
 /* ------------------------------------------------------------------ */
 /* Motor commands                                                     */
 /* ------------------------------------------------------------------ */
 
+/** @brief Set the target speed for subsequent motor commands (0-6000 RPM). */
 static void HandleSetSpeedCmd(char *param) {
   int rpm = atoi(param);
   if (rpm >= 0 && rpm <= 6000) {
@@ -269,16 +337,18 @@ static void HandleSetSpeedCmd(char *param) {
   }
 }
 
+/** @brief Set the step count for MOVE_CW_STEPS / MOVE_CCW_STEPS. */
 static void HandleSetStepsCmd(char *param) {
   int32_t steps = atol(param);
   if (steps >= 0) {
     stored_target_steps = steps;
-    SendResponseF("OK:Steps=%ld\n", (long)steps);
+    SendResponseF("OK:Steps=%d\n", (int)steps);
   } else {
     SendResponse("ERR:Steps must be >= 0\n");
   }
 }
 
+/** @brief Start continuous clockwise rotation at stored RPM. */
 static void HandleMoveCWCmd(void) {
   if (stored_target_rpm <= 0) {
     SendResponse("ERR:Set speed first\n");
@@ -290,6 +360,7 @@ static void HandleMoveCWCmd(void) {
   SendResponseF("OK:CW @ %d RPM\n", stored_target_rpm);
 }
 
+/** @brief Start continuous counter-clockwise rotation at stored RPM. */
 static void HandleMoveCCWCmd(void) {
   if (stored_target_rpm <= 0) {
     SendResponse("ERR:Set speed first\n");
@@ -301,6 +372,7 @@ static void HandleMoveCCWCmd(void) {
   SendResponseF("OK:CCW @ %d RPM\n", stored_target_rpm);
 }
 
+/** @brief Move the stored number of steps clockwise. */
 static void HandleMoveCWStepsCmd(void) {
   if (stored_target_steps <= 0) {
     SendResponse("ERR:Set steps first\n");
@@ -313,9 +385,10 @@ static void HandleMoveCWStepsCmd(void) {
   HAL_GPIO_WritePin(TMC2225_MICROSTEPS_GPIO_Port, TMC2225_MICROSTEPS_Pin,
                     GPIO_PIN_SET);
   MC_MoveSteps(stored_target_steps, true);
-  SendResponseF("OK:%ld steps CW\n", (long)stored_target_steps);
+  SendResponseF("OK:%d steps CW\n", (int)stored_target_steps);
 }
 
+/** @brief Move the stored number of steps counter-clockwise. */
 static void HandleMoveCCWStepsCmd(void) {
   if (stored_target_steps <= 0) {
     SendResponse("ERR:Set steps first\n");
@@ -328,9 +401,10 @@ static void HandleMoveCCWStepsCmd(void) {
   HAL_GPIO_WritePin(TMC2225_MICROSTEPS_GPIO_Port, TMC2225_MICROSTEPS_Pin,
                     GPIO_PIN_SET);
   MC_MoveSteps(stored_target_steps, false);
-  SendResponseF("OK:%ld steps CCW\n", (long)stored_target_steps);
+  SendResponseF("OK:%d steps CCW\n", (int)stored_target_steps);
 }
 
+/** @brief Emergency stop — disable the motor driver immediately. */
 static void HandleStopCmd(void) {
   MC_Stop();
   SendResponse("OK:Stopped\n");
@@ -340,6 +414,12 @@ static void HandleStopCmd(void) {
 /* Status                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief Read all sensor values and send a structured status line.
+ *
+ * The status line contains comma-separated key:value pairs consumed by the
+ * Python GUI for live display and data collection.
+ */
 static void HandleStatusCmd(void) {
   uint32_t lir_raw = ENC_ReadLIRRaw();
   uint32_t mt_raw = ENC_ReadMT6835Raw();
@@ -366,6 +446,8 @@ static void HandleStatusCmd(void) {
 
   bool motor_en = MC_IsEnabled();
   uint16_t zero_pos = ENC_GetMT6835ZeroPos();
+
+  /* Reconstruct pre-ZERO_POS physical angle (12-bit to 21-bit scaling). */
   uint32_t zero_pos_21bit = (uint32_t)zero_pos * 512u;
   uint32_t mt_physical = (mt_raw + zero_pos_21bit) & 0x1FFFFF;
 
@@ -374,33 +456,40 @@ static void HandleStatusCmd(void) {
   uint8_t reg_11 = ENC_ReadMT6835Register(MT6835_REG_BW);
   uint8_t bw_val = reg_11 & 0x07;
 
-  SendResponseF("STATUS_LIR-DA237T_POS:%lu,"
-                "STATUS_MT6835_POS:%lu,"
-                "STATUS_MT6835_RAW:%lu,"
+  SendResponseF("STATUS_LIR-DA237T_POS:%u,"
+                "STATUS_MT6835_POS:%u,"
+                "STATUS_MT6835_RAW:%u,"
                 "STATUS_MT6835_ZERO_POS:%u,"
                 "STATUS_TMC2225_EN:%s,"
                 "STATUS_MT6835_USER_CAL:%s,"
                 "STATUS_HOME:%s,"
                 "STATUS_MT6835_HYST:%u,"
                 "STATUS_MT6835_BW:%u\n",
-                (unsigned long)lir_raw, (unsigned long)mt_raw,
-                (unsigned long)mt_physical, (unsigned int)zero_pos,
+                (unsigned int)lir_raw, (unsigned int)mt_raw,
+                (unsigned int)mt_physical, (unsigned int)zero_pos,
                 motor_en ? "True" : "False", cal_str, homed ? "True" : "False",
                 (unsigned int)hyst_val, (unsigned int)bw_val);
 }
 
 /* ------------------------------------------------------------------ */
-/* MT6835 configuration                                               */
+/* MT6835 configuration commands                                      */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief Set current shaft position as MT6835 zero (ZERO_POS register).
+ *
+ * This is a commissioning-time operation. Changing ZERO_POS shifts the NLC
+ * lookup table grid, so any existing NLC calibration becomes invalid.
+ */
 static void HandleSetMT6835ZeroCmd(void) {
   bool ack = ENC_SetMT6835Zero();
   uint32_t mt = ENC_ReadMT6835Raw();
   uint16_t zp = ENC_GetMT6835ZeroPos();
-  SendResponseF("OK:MT6835 zero ACK=%s ZERO_POS=%u MT=%lu\n",
-                ack ? "OK" : "FAIL", zp, (unsigned long)mt);
+  SendResponseF("OK:MT6835 zero ACK=%s MT=%u ZERO_POS=%u\n",
+                ack ? "OK" : "FAIL", (unsigned int)mt, zp);
 }
 
+/** @brief Set LIR-DA237T BiSS-C resolution (21, 22, or 23 bits). */
 static void HandleLIRBitsCmd(char *param) {
   int bits = atoi(param);
   if (bits >= 21 && bits <= 23) {
@@ -411,6 +500,7 @@ static void HandleLIRBitsCmd(char *param) {
   }
 }
 
+/** @brief Print LIR-DA237T BiSS-C debug information (raw SPI frame, CRC). */
 static void HandleLIRDebugCmd(void) {
   char debug_str[512];
   ENC_GetLIRDebugInfo(debug_str, sizeof(debug_str));
@@ -419,18 +509,21 @@ static void HandleLIRDebugCmd(void) {
   SendResponse("\n");
 }
 
+/** @brief Assert CAL_EN pin to start MT6835 user auto-calibration. */
 static void HandleMT6835CalEnCmd(void) {
   HAL_GPIO_WritePin(MT6835_CAL_EN_GPIO_Port, MT6835_CAL_EN_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LED_2_GPIO_Port, LED_2_Pin, GPIO_PIN_SET);
   SendResponse("OK:CAL_EN=HIGH\n");
 }
 
+/** @brief De-assert CAL_EN pin to end MT6835 user auto-calibration. */
 static void HandleMT6835CalDisCmd(void) {
   HAL_GPIO_WritePin(MT6835_CAL_EN_GPIO_Port, MT6835_CAL_EN_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(LED_2_GPIO_Port, LED_2_Pin, GPIO_PIN_RESET);
   SendResponse("OK:CAL_EN=LOW\n");
 }
 
+/** @brief Dump all MT6835 configuration registers (0x001-0x012). */
 static void HandleMT6835ReadRegsCmd(void) {
   char buf[400];
   ENC_GetMT6835RegisterDump(buf, sizeof(buf));
@@ -439,6 +532,10 @@ static void HandleMT6835ReadRegsCmd(void) {
   SendResponse("\n");
 }
 
+/**
+ * @brief Configure the AUTOCAL_FREQ register for the given RPM.
+ * @param param ASCII decimal RPM string.
+ */
 static void HandleSetAutocalRpmCmd(char *param) {
   int rpm = atoi(param);
   ENC_ConfigureAutoCalRPM(rpm);
@@ -446,57 +543,16 @@ static void HandleSetAutocalRpmCmd(char *param) {
 }
 
 /* ------------------------------------------------------------------ */
-/* HYST and BW control                                                */
+/* NLC table commands                                                 */
 /* ------------------------------------------------------------------ */
 
 /**
- * @brief Set the MT6835 output hysteresis window.
- * @param param HYST register value 0-7:
- *   0=0.022 deg, 1=0.044, 2=0.088, 3=0.176,
- *   4=OFF, 5=0.003, 6=0.006, 7=0.011 (default)
+ * @brief Write an NLC table to MT6835 registers and program to EEPROM.
+ * @param param 384-character hex string (192 bytes packed MSB-first).
  *
- * Writes to register 0x00D bits [2:0], preserving MagnTek bits [7:4]
- * and ROT_DIR bit [3].
+ * This writes the NLC data to registers 0x013-0x0D2, enables NLC_EN,
+ * and programs the entire register map into EEPROM (~6 seconds).
  */
-static void HandleMT6835SetHystCmd(char *param) {
-  int val = atoi(param);
-  if (val < 0 || val > 7) {
-    SendResponse("ERR:HYST 0-7 only\n");
-    return;
-  }
-  uint8_t reg = ENC_ReadMT6835Register(MT6835_REG_DIR_HYST);
-  reg = (reg & 0xF8) | ((uint8_t)val & 0x07);
-  ENC_WriteMT6835Register(MT6835_REG_DIR_HYST, reg);
-  HAL_Delay(2);
-  uint8_t readback = ENC_ReadMT6835Register(MT6835_REG_DIR_HYST);
-  SendResponseF("OK:HYST=%d (reg=0x%02X)\n", readback & 0x07, readback);
-}
-
-/**
- * @brief Set the MT6835 system bandwidth.
- * @param param BW register value 0-7:
- *   0=Baseline (slowest, best noise), 5=x32 (default), 7=x128 (fastest)
- *
- * Writes to register 0x011 bits [2:0], preserving MagnTek bits [7:3].
- */
-static void HandleMT6835SetBWCmd(char *param) {
-  int val = atoi(param);
-  if (val < 0 || val > 7) {
-    SendResponse("ERR:BW 0-7 only\n");
-    return;
-  }
-  uint8_t reg = ENC_ReadMT6835Register(MT6835_REG_BW);
-  reg = (reg & 0xF8) | ((uint8_t)val & 0x07);
-  ENC_WriteMT6835Register(MT6835_REG_BW, reg);
-  HAL_Delay(2);
-  uint8_t readback = ENC_ReadMT6835Register(MT6835_REG_BW);
-  SendResponseF("OK:BW=%d (reg=0x%02X)\n", readback & 0x07, readback);
-}
-
-/* ------------------------------------------------------------------ */
-/* NLC commands                                                       */
-/* ------------------------------------------------------------------ */
-
 static void HandleLoadNLCCmd(char *param) {
   size_t len = strlen(param);
   if (len != 384) {
@@ -514,6 +570,7 @@ static void HandleLoadNLCCmd(char *param) {
   SendResponseF("OK:NLC %s\n", prog_ok ? "programmed" : "EEPROM failed");
 }
 
+/** @brief Read back the NLC table from MT6835 registers (for verification). */
 static void HandleMT6835ReadNLCCmd(void) {
   char buf[400];
   ENC_ReadNLCTable(buf, sizeof(buf));
@@ -522,22 +579,28 @@ static void HandleMT6835ReadNLCCmd(void) {
   SendResponse("\n");
 }
 
+/** @brief Clear the NLC table, disable NLC_EN, and program EEPROM. */
 static void HandleMT6835ClearNLCCmd(void) {
   SendResponse("INFO:Clearing NLC + EEPROM...\n");
   bool ok = ENC_ClearNLCTable();
   SendResponseF("OK:NLC clear %s\n", ok ? "OK" : "EEPROM fail");
 }
 
+/** @brief Enable NLC correction in RAM (not persisted until EEPROM program). */
 static void HandleMT6835EnableNLCCmd(void) {
   bool ok = ENC_SetNLCEnabled(true);
   SendResponseF("OK:NLC %s\n", ok ? "enabled" : "failed");
 }
 
+/** @brief Disable NLC correction in RAM (not persisted until EEPROM program).
+ */
 static void HandleMT6835DisableNLCCmd(void) {
   bool ok = ENC_SetNLCEnabled(false);
   SendResponseF("OK:NLC %s\n", ok ? "disabled" : "failed");
 }
 
+/** @brief Program all MT6835 registers to EEPROM (~6 second blocking
+ * operation). */
 static void HandleMT6835ProgramEEPROMCmd(void) {
   SendResponse("INFO:Programming EEPROM (6s)...\n");
   bool ok = ENC_ProgramMT6835EEPROM();
