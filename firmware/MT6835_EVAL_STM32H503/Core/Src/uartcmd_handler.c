@@ -42,7 +42,7 @@ static void SendResponse(const char *msg) {
 
 /** @brief Send a printf-formatted string over UART1 (max 300 chars). */
 static void SendResponseF(const char *fmt, ...) {
-  char buf[300];
+  char buf[512];
   va_list args;
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);

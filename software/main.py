@@ -936,7 +936,11 @@ class EncoderEvaluationGUI(QMainWindow):
                         self.bw_combo.setCurrentIndex(idx)
                         self._suppress_combo_send = False
                 elif key == "STATUS_MT6835_USER_CAL":
-                    if self.calibration_manager:
+                    if (
+                        self.calibration_manager
+                        and self.calibration_manager.calibration_in_progress
+                        and self.calibration_manager.calibration_type == "user"
+                    ):
                         v = val.upper().strip()
                         if v == "RUNNING":
                             self.calibration_manager.handle_user_cal_running()

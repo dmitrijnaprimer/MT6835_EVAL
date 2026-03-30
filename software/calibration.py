@@ -24,7 +24,6 @@ from typing import Callable, List, Optional
 
 import numpy as np
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
-from PyQt5.QtWidgets import QApplication
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "data")
@@ -101,38 +100,46 @@ class CalibrationManager(QObject):
     def start_user_calibration(self, rpm: int = 60):
         """Start the MT6835 internal auto-calibration procedure.
 
+        Non-blocking: sends commands via QTimer delays so the GUI stays responsive.
+
         :param rpm: Motor speed for calibration (25-200 RPM).
         """
         if self.calibration_in_progress:
             return
         self.calibration_in_progress = True
         self.calibration_type = "user"
+        self._ucal_rpm = rpm
         self.console_updater(f"=== User Auto-Cal @ {rpm} RPM ===")
-        try:
-            self.serial_sender(f"SET_SPEED {rpm}")
-            time.sleep(0.2)
-            self.serial_sender(f"SET_AUTOCAL_RPM {rpm}")
-            time.sleep(0.2)
-            self.console_updater("Spinning up motor (5s)...")
-            time.sleep(5)
-            self.serial_sender("MOVE_CW")
-            time.sleep(2)
-            self.serial_sender("MT6835_CAL_ENABLE")
-            time.sleep(0.1)
-            self.user_cal_timeout_counter = 0
-            self.user_cal_timer.start(1000)
-        except Exception as e:
-            self.console_updater(f"Error: {e}")
-            self.cancel_calibration()
+        self.serial_sender(f"SET_SPEED {rpm}")
+        QTimer.singleShot(200, self._ucal_step2)
+
+    def _ucal_step2(self):
+        """Configure autocal frequency and start motor."""
+        self.serial_sender(f"SET_AUTOCAL_RPM {self._ucal_rpm}")
+        QTimer.singleShot(200, self._ucal_step3)
+
+    def _ucal_step3(self):
+        """Start motor and wait 5s for stable speed."""
+        self.serial_sender("MOVE_CW")
+        self.console_updater("Motor started, waiting 5s for stable speed...")
+        QTimer.singleShot(5000, self._ucal_step4)
+
+    def _ucal_step4(self):
+        """Assert CAL_EN and start polling for completion."""
+        self.serial_sender("MT6835_CAL_ENABLE")
+        self.console_updater("CAL_EN asserted, polling for completion...")
+        self.user_cal_timeout_counter = 0
+        self.user_cal_timer.start(2000)
 
     def _check_user_cal_status(self):
-        """Timer callback: poll STATUS to check auto-cal progress."""
+        """Timer callback: read cal status register to check progress."""
         if not self.calibration_in_progress:
+            self.user_cal_timer.stop()
             return
         self.serial_sender("STATUS")
         self.user_cal_timeout_counter += 1
-        if self.user_cal_timeout_counter > 100:
-            self.console_updater("ERROR: User Cal timeout")
+        if self.user_cal_timeout_counter > 60:
+            self.console_updater("ERROR: User Cal timeout (2 min)")
             self.cancel_calibration()
 
     def handle_user_cal_running(self):
@@ -142,16 +149,17 @@ class CalibrationManager(QObject):
     def handle_user_cal_success(self):
         """Called when STATUS reports USER_CAL = OK."""
         self.user_cal_timer.stop()
+        self.calibration_in_progress = False
+        self.calibration_type = None
         self.console_updater("User Cal: SUCCESS! Waiting 6.5s for EEPROM...")
-        for _ in range(65):
-            QApplication.processEvents()
-            time.sleep(0.1)
+        QTimer.singleShot(6500, self._ucal_finish)
+
+    def _ucal_finish(self):
+        """Disable CAL_EN and stop motor after EEPROM write completes."""
         self.serial_sender("MT6835_CAL_DISABLE")
         self.serial_sender("STOP_MOTOR")
         self.console_updater("DONE. Power cycle MT6835 now.")
         self.calibration_finished.emit(True, "user")
-        self.calibration_in_progress = False
-        self.calibration_type = None
 
     def handle_user_cal_error(self):
         """Called when STATUS reports USER_CAL = Failed."""
