@@ -42,15 +42,15 @@ python main.py
 7. **Collect Data** again to verify improvement
 
 
-## Project structure
+## Project structure in root directory
 
 ```
 software/       — Python GUI (PyQt5) + calibration logic
 firmware/       — STM32 firmware (STM32CubeIDE, C)
 data/           — collected CSV data (gitignored)
-data/nlc/       — generated NLC hex files
+data/nlc/       — generated NLC hex files (gitignored)
 construction/   — mechanical CAD
-docs/           — technical report, command reference
+docs/           — technical report, datasheets
 ```
 
 ## License
