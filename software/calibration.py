@@ -77,7 +77,6 @@ class CalibrationManager(QObject):
         self.state = "IDLE"
         self.wait_counter = 0
         self.sample_interval_counter = 0
-        self.skip_first_point = False
 
         self.data_lir: List[float] = []
         self.data_mt: List[float] = []
@@ -240,8 +239,8 @@ class CalibrationManager(QObject):
         self.temp_mt_samples = []
         self.wait_counter = 0
         self.sample_interval_counter = 0
-        self.skip_first_point = True
-        self.state = "SETTLE"
+        # Start by sampling at Home position (≈0°), then move+sample
+        self.state = "SAMPLE_WAIT"
         self.console_updater("Collecting...")
         self.step_timer.start(50)
 
@@ -295,16 +294,9 @@ class CalibrationManager(QObject):
                 self.state = "SAMPLE_WAIT"
 
     def _store_point(self):
-        """Compute median of samples and store. Discards first point."""
+        """Compute median of samples and store."""
         avg_lir = float(np.median(self.temp_lir_samples))
         avg_mt = float(np.median(self.temp_mt_samples))
-
-        if self.skip_first_point:
-            self.skip_first_point = False
-            self.temp_lir_samples = []
-            self.temp_mt_samples = []
-            self.state = "MOVE"
-            return
 
         self.data_lir.append(avg_lir)
         self.data_mt.append(avg_mt)
@@ -362,7 +354,12 @@ class CalibrationManager(QObject):
     # ================================================================
 
     def generate_nlc_from_last_collection(self):
-        """Compute an NLC correction table from the last collected data."""
+        """Compute an NLC correction table from the last collected data.
+
+        Uses direct assignment: measurement point i → NLC grid point i.
+        This works because collection starts at Home (≈0°) and step size
+        matches the NLC grid spacing (12800/256 = 50 µsteps = 1.406°).
+        """
         if not self.data_lir or not self.data_mt:
             self.console_updater("No data to generate NLC from.")
             return
@@ -380,31 +377,30 @@ class CalibrationManager(QObject):
             f"Mean={np.mean(error):+.5f} deg"
         )
 
-        zero_pos_deg = self.zero_pos_raw * 360.0 / 4096.0
-        nlc_raw_angles = np.linspace(0, 360.0, 256, endpoint=False)
-        nlc_user_angles = (nlc_raw_angles - zero_pos_deg) % 360.0
-
-        ref_ext = np.concatenate([ref - 360, ref, ref + 360])
-        err_ext = np.concatenate([error, error, error])
-        sort_idx = np.argsort(ref_ext)
-        error_at_nlc = np.interp(nlc_user_angles, ref_ext[sort_idx], err_ext[sort_idx])
-        error_ac = error_at_nlc - np.mean(error_at_nlc)
+        # Direct assignment: error[i] → NLC[i]
+        # DC removal (chip does this internally, but we do it for prediction)
+        error_ac = error - np.mean(error)
 
         correction_lsb = -error_ac / self.NLC_LSB_DEGREES
         nlc_signed = np.clip(np.round(correction_lsb).astype(int), -32, 31)
 
-        n_sat = int(np.sum((nlc_signed == -32) | (nlc_signed == 31)))
-        chip_corr = (nlc_signed - np.mean(nlc_signed)) * self.NLC_LSB_DEGREES
-        residual = error_ac + chip_corr
+        # Account for ZERO_POS: NLC is indexed by physical angle
+        zero_pos_shift = int(round(self.zero_pos_raw * 256 / 4096))
+        nlc_shifted = np.roll(nlc_signed, zero_pos_shift)
+
+        n_sat = int(np.sum((nlc_shifted == -32) | (nlc_shifted == 31)))
+        chip_corr = (nlc_shifted - np.mean(nlc_shifted)) * self.NLC_LSB_DEGREES
+        # Predict residual on unshifted error
+        residual = error_ac + np.roll(chip_corr, -zero_pos_shift)
 
         self.console_updater(
-            f"  NLC: [{np.min(nlc_signed)}..{np.max(nlc_signed)}]  "
-            f"sat={n_sat}/256  ZERO_POS={self.zero_pos_raw}\n"
+            f"  NLC: [{np.min(nlc_shifted)}..{np.max(nlc_shifted)}]  "
+            f"sat={n_sat}/256  ZERO_POS={self.zero_pos_raw} (shift={zero_pos_shift})\n"
             f"  Predicted: {np.ptp(error_ac):.5f} -> {np.ptp(residual):.5f} deg "
             f"({(1 - np.ptp(residual) / np.ptp(error_ac)) * 100:.0f}% reduction)"
         )
 
-        hex_data = self._pack_nlc_msb_first(nlc_signed).hex().upper()
+        hex_data = self._pack_nlc_msb_first(nlc_shifted).hex().upper()
         os.makedirs(NLC_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"nlc_table_{ts}.hex"

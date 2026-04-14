@@ -218,14 +218,12 @@ static void WaitForMoveComplete(uint32_t timeout_ms) {
 /**
  * @brief Move the shaft to the LIR-DA237T absolute zero position.
  *
- * Uses a coarse-then-fine approach: reads the LIR absolute position, calculates
- * direction and distance to raw position zero, moves there, and sets the LIR
- * software offset so subsequent reads start from 0 degrees.
- *
- * Does NOT change the MT6835 ZERO_POS register. Use SET_ZERO_MT6835 separately
- * during commissioning — changing ZERO_POS invalidates the NLC table alignment.
+ * Three-pass homing: coarse (5 RPM), fine (1 RPM), ultra-fine (1 RPM).
+ * If already near zero, backs off 10° first to ensure a clean approach.
+ * Does NOT change MT6835 ZERO_POS.
  */
 static void HandleHomeCmd(void) {
+  /* Enable driver, 32 microsteps. */
   HAL_GPIO_WritePin(TMC2225_EN_GPIO_Port, TMC2225_EN_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(TMC2225_MICROSTEPS_GPIO_Port, TMC2225_MICROSTEPS_Pin,
                     GPIO_PIN_SET);
@@ -235,19 +233,33 @@ static void HandleHomeCmd(void) {
   uint32_t max_counts = 1UL << bits;
   int32_t half_counts = (int32_t)(max_counts / 2);
 
-  /* Reset LIR offset to read absolute physical position. */
+  /* Reset LIR to read absolute physical position. */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
-
   uint32_t pos0 = ENC_ReadLIRRaw();
-  SendResponseF("INFO:LIR abs pos=%u/%u\n", (unsigned int)pos0,
-                (unsigned int)max_counts);
 
-  /* Move 200 microsteps CW to determine direction mapping. */
-  MC_SetTargetRPM(5);
+  SendResponseF("INFO:Homing from LIR=%u\n", (unsigned int)pos0);
+
+  /* If already very close to zero (within ~2°), back off 10° first
+     so the direction calibration step gets a clean reading. */
+  float deg0 = (float)pos0 / (float)max_counts * 360.0f;
+  if (deg0 < 2.0f || deg0 > 358.0f) {
+    int32_t backoff_steps = (int32_t)(10.0f / 360.0f * 12800.0f);
+    SendResponse("INFO:Near zero, backing off 10 deg\n");
+    MC_SetTargetRPM(5);
+    MC_MoveSteps(backoff_steps, true);
+    WaitForMoveComplete(10000);
+    HAL_Delay(500);
+    ENC_SetLIRBits(bits);
+    HAL_Delay(50);
+    pos0 = ENC_ReadLIRRaw();
+  }
+
+  /* Direction calibration: move 200 µsteps CW and measure LIR change. */
+  MC_SetTargetRPM(3);
   MC_MoveSteps(200, true);
   WaitForMoveComplete(5000);
-  HAL_Delay(300);
+  HAL_Delay(500);
 
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
@@ -261,64 +273,90 @@ static void HandleHomeCmd(void) {
 
   float counts_per_step = (float)delta / 200.0f;
   if (fabsf(counts_per_step) < 0.5f) {
-    SendResponse("ERR:LIR not responding to motor movement\n");
+    SendResponse("ERR:LIR not responding to motor\n");
     MC_Stop();
     return;
   }
 
-  /* Coarse move to LIR raw zero. */
+  /* --- Pass 1: coarse move at 5 RPM --- */
   int32_t to_zero = -(int32_t)pos1;
   if (to_zero > half_counts)
     to_zero -= (int32_t)max_counts;
   if (to_zero < -half_counts)
     to_zero += (int32_t)max_counts;
 
-  int32_t steps_needed = (int32_t)((float)to_zero / counts_per_step);
-  bool go_cw = (steps_needed > 0);
-  int32_t abs_steps = (steps_needed > 0) ? steps_needed : -steps_needed;
+  int32_t steps = (int32_t)((float)to_zero / counts_per_step);
+  bool cw = (steps > 0);
+  int32_t abs_s = cw ? steps : -steps;
 
-  if (abs_steps > 1) {
+  if (abs_s > 1) {
     MC_SetTargetRPM(5);
-    MC_MoveSteps(abs_steps, go_cw);
+    MC_MoveSteps(abs_s, cw);
     WaitForMoveComplete(30000);
     HAL_Delay(500);
   }
 
-  /* Fine correction pass. */
+  /* --- Pass 2: fine correction at 1 RPM --- */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
   uint32_t pos2 = ENC_ReadLIRRaw();
 
-  int32_t remaining = -(int32_t)pos2;
-  if (remaining > half_counts)
-    remaining -= (int32_t)max_counts;
-  if (remaining < -half_counts)
-    remaining += (int32_t)max_counts;
+  int32_t rem = -(int32_t)pos2;
+  if (rem > half_counts)
+    rem -= (int32_t)max_counts;
+  if (rem < -half_counts)
+    rem += (int32_t)max_counts;
 
-  int32_t fine_steps = (int32_t)((float)remaining / counts_per_step);
-  bool fine_cw = (fine_steps > 0);
-  int32_t fine_abs = (fine_steps > 0) ? fine_steps : -fine_steps;
+  steps = (int32_t)((float)rem / counts_per_step);
+  cw = (steps > 0);
+  abs_s = cw ? steps : -steps;
 
-  if (fine_abs > 1) {
+  if (abs_s > 1) {
     MC_SetTargetRPM(1);
-    MC_MoveSteps(fine_abs, fine_cw);
+    MC_MoveSteps(abs_s, cw);
     WaitForMoveComplete(30000);
     HAL_Delay(500);
   }
 
-  /* Set LIR software zero at this position. MT6835 zero is NOT touched. */
+  /* --- Pass 3: ultra-fine at 1 RPM --- */
   ENC_SetLIRBits(bits);
   HAL_Delay(50);
-  /* Read final positions. LIR reports true physical position (no software
-   * offset). */
+  uint32_t pos3 = ENC_ReadLIRRaw();
+
+  rem = -(int32_t)pos3;
+  if (rem > half_counts)
+    rem -= (int32_t)max_counts;
+  if (rem < -half_counts)
+    rem += (int32_t)max_counts;
+
+  steps = (int32_t)((float)rem / counts_per_step);
+  cw = (steps > 0);
+  abs_s = cw ? steps : -steps;
+
+  if (abs_s > 0) {
+    MC_SetTargetRPM(1);
+    MC_MoveSteps(abs_s, cw);
+    WaitForMoveComplete(30000);
+    HAL_Delay(500);
+  }
+
+  /* Final verification read. */
+  ENC_SetLIRBits(bits);
+  HAL_Delay(50);
   ENC_ReadLIRRaw();
   homed = true;
 
   uint32_t lir_final = ENC_ReadLIRRaw();
   uint32_t mt_final = ENC_ReadMT6835Raw();
+  /* Compute homing error in millidegrees (integer, no float printf). */
+  int32_t err_mdeg =
+      (int32_t)((float)lir_final / (float)max_counts * 360000.0f);
+  if (err_mdeg > 180000)
+    err_mdeg -= 360000;
 
-  SendResponseF("OK:Homed LIR=%u MT=%u\n", (unsigned int)lir_final,
-                (unsigned int)mt_final);
+  SendResponseF("OK:Homed LIR=%u (%d.%03d deg off) MT=%u\n",
+                (unsigned int)lir_final, (int)(err_mdeg / 1000),
+                (int)(abs(err_mdeg) % 1000), (unsigned int)mt_final);
 }
 
 /* ------------------------------------------------------------------ */
