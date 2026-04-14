@@ -2,20 +2,27 @@
 
 Evaluation fixture for the MagnTek MT6835 21-bit magnetic encoder IC.
 
-Measures MT6835 nonlinearity against a LIR-DA237T 21/22/23-bit optical reference encoder, computes NLC (Non-Linearity Compensation) correction tables.
+Measures MT6835 nonlinearity against a LIR-DA237T 23-bit optical reference encoder, computes NLC (Non-Linearity Compensation) correction tables, and programs them into the chip.
 
 ## Hardware
 
-- **MCU:** STM32H503CBT6 (Not recommended under ANY circumstances!)
-- **Evaluated encoder:** MT6835
-- **Reference encoder:** LIR-DA237T (BiSS-C, 21/22/23-bit)
+- **MCU:** STM32H503CBT6 (not recommended — any dual-SPI MCU will do)
+- **Evaluated encoder:** MagnTek MT6835 (SPI, 21-bit)
+- **Reference encoder:** LIR-DA237T (BiSS-C, 23-bit, ±0.0083°)
 - **Motor driver:** TMC2225 (STEP/DIR, 32 microsteps)
-- **Motor:** 400 steps/rev (0.9°), 12800 microsteps/rev
+- **Motor:** 400 steps/rev (0.9°), 12 800 microsteps/rev
 
-Single-shaft fixture — both encoders are on the same shaft, stepper rotates it in discrete steps for data collection. Magnet is fixed on the shaft end, fitted to special adapter.
-Adapters are available for 4x2mm round, 6x2.5mm round, 6x6x6 cube neodymium magnets.
+Single-shaft fixture — both encoders and the stepper on the same shaft. Magnet is fixed on the shaft end via replaceable adapter. Adapters available for 4×2 mm round, 6×2.5 mm round, 6×6×6 mm cube magnets. Optimal air gap: 0.5–1.5 mm.
 
-Optimal air gap between magnet and MT6835 is 1-2mm.
+## Key findings (not in the datasheet)
+
+| Parameter | Value |
+|-----------|-------|
+| NLC LSB | 360°/2¹⁸ = 0.001373° (8 counts of 21-bit angle) |
+| NLC packing | MSB-first, 6-bit two's complement |
+| NLC grid | indexed by raw magnetic angle (before ZERO_POS) |
+| DC removal | chip subtracts the mean automatically |
+| NLC range | ±0.044° per point (±32 LSB) |
 
 ## Quick Start
 
@@ -26,11 +33,25 @@ python main.py
 
 ## Workflow
 
-1. Run **User Auto-Cal** at 50 RPM (built-in MT6835 calibration, gets INL to ~±0.07°)
-2. **Collect Data** — stepped measurement at 256-512 positions around 360°
-3. **Generate NLC** — computes a 256-entry correction table from the collected error
-4. **Upload NLC** — writes the table to MT6835 registers and programs EEPROM
-5. Collect again to verify improvement
+1. **User Auto-Cal** — built-in MT6835 calibration at 50–100 RPM (gets INL to ~±0.07°)
+2. **Home** — move shaft to LIR zero position
+3. **Set Zero Pos** — set MT6835 ZERO_POS (must be done before NLC, never after)
+4. **Collect Data** — stepped measurement at 256 positions across 360°
+5. **Generate NLC** — computes correction table from collected error profile
+6. **Upload NLC** — writes table to MT6835 registers + EEPROM
+7. **Collect Data** again to verify improvement
+
+
+## Project structure
+
+```
+software/       — Python GUI (PyQt5) + calibration logic
+firmware/       — STM32 firmware (STM32CubeIDE, C)
+data/           — collected CSV data (gitignored)
+data/nlc/       — generated NLC hex files
+construction/   — mechanical CAD
+docs/           — technical report, command reference
+```
 
 ## License
 
