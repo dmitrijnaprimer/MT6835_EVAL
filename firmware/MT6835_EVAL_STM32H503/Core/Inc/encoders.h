@@ -194,6 +194,15 @@ void ENC_SetLIRBits(uint8_t bits);
 /** @brief Return current LIR resolution in bits. */
 uint8_t ENC_GetLIRBits(void);
 
+/** @brief Set current LIR position as software zero offset. */
+void ENC_SetLIRZero(void);
+
+/** @brief Set LIR direction inversion flag. */
+void ENC_SetLIRInvertDirection(bool invert);
+
+/** @brief Return current LIR direction inversion state. */
+bool ENC_GetLIRInvertDirection(void);
+
 /**
  * @brief Read LIR position via BiSS-C protocol.
  *

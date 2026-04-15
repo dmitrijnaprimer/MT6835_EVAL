@@ -20,6 +20,8 @@ extern SPI_HandleTypeDef hspi2;
 
 /* ---- LIR state ---- */
 static volatile uint32_t lir_raw_cached = 0;
+static volatile uint32_t lir_raw_physical = 0;
+static volatile uint32_t lir_offset = 0;
 static volatile float lir_degrees_cached = 0.0f;
 static uint8_t lir_num_bits = LIR_NUM_BITS_DEFAULT;
 
@@ -351,10 +353,27 @@ void ENC_GetMT6835RegisterDump(char *buffer, size_t max_len) {
 void ENC_SetLIRBits(uint8_t bits) {
   lir_num_bits = (bits >= LIR_MIN_BITS && bits <= LIR_MAX_BITS) ? bits : LIR_NUM_BITS_DEFAULT;
   lir_raw_cached = 0;
+  lir_raw_physical = 0;
   lir_degrees_cached = 0.0f;
+  lir_offset = 0;
 }
 
 uint8_t ENC_GetLIRBits(void) { return lir_num_bits; }
+
+/** @brief Set current LIR position as software zero offset. */
+void ENC_SetLIRZero(void) {
+  ENC_ReadLIRRaw();
+  lir_offset = lir_raw_physical;
+  lir_raw_cached = 0;
+  lir_degrees_cached = 0.0f;
+}
+
+/** @brief Set LIR direction inversion flag. */
+void ENC_SetLIRInvertDirection(bool invert) { (void)invert; }
+
+/** @brief Return current LIR direction inversion state. */
+bool ENC_GetLIRInvertDirection(void) { return false; }
+
 float ENC_GetLIRDegrees(void) { return lir_degrees_cached; }
 
 /**
@@ -411,8 +430,11 @@ uint32_t ENC_ReadLIRRaw(void) {
         else if (calc == rx_crc && (data != 0 || calc != 0))
           debug_crc_ok = 1;
 
-        if (debug_crc_ok > 0)
-          lir_raw_cached = data;
+        if (debug_crc_ok > 0) {
+          lir_raw_physical = data;
+          uint32_t mask = (uint32_t)((1ULL << nbits) - 1);
+          lir_raw_cached = (lir_raw_physical - lir_offset) & mask;
+        }
         break;
       }
     }
@@ -441,6 +463,8 @@ void ENC_GetLIRDebugInfo(char *debug_str, size_t debug_str_size) {
 void ENC_Init(void) {
   HAL_Delay(100);
   lir_num_bits = LIR_NUM_BITS_DEFAULT;
+  lir_offset = 0;
+  lir_raw_physical = 0;
   lir_raw_cached = 0;
   lir_degrees_cached = 0.0f;
   mt6835_raw_cached = 0;
