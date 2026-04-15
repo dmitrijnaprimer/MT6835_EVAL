@@ -5,8 +5,11 @@ data/nlc/*.hex
 !data/.gitkeep
 !data/nlc/.gitkeep
 
-# Obsidian image vault (report images)
+# Images
 images/
+
+# Docs
+docs/
 
 # Python
 __pycache__/
