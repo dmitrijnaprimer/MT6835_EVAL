@@ -1,11 +1,14 @@
+# Data (collected measurements, generated NLC tables)
 data/*.csv
 data/nlc/*.csv
 data/nlc/*.hex
 !data/.gitkeep
 !data/nlc/.gitkeep
 
+# Obsidian image vault (report images)
 images/
 
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -14,22 +17,33 @@ __pycache__/
 venv/
 env/
 .env
+pyproject.toml
 
+# IDE / editor
 .vscode/
+.idea/
 *.swp
 *.swo
 *~
-Thumbs.db
-.DS_Store
 .clangd/
 .clangd
+compile_commands.json
 
+# OS
+Thumbs.db
+.DS_Store
+
+# STM32 firmware build
+firmware/**/build/
 firmware/**/Debug/
 firmware/**/Release/
 firmware/**/.settings/
 firmware/**/*.launch
 firmware/**/Drivers/
+firmware/**/cmake/stm32cubemx/
+firmware/**/.mxproject
 
+# Misc
 *.log
 *.bak
 *.tmp
