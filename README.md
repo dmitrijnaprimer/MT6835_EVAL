@@ -2,7 +2,7 @@
 
 Evaluation fixture for the MagnTek MT6835 21-bit magnetic encoder IC.
 
-Measures MT6835 nonlinearity against a LIR-DA237T 23-bit optical reference encoder, computes NLC (Non-Linearity Compensation) correction tables, and programs them into the chip.
+Measures MT6835 nonlinearity against a LIR-DA237T 23-bit optical reference encoder, computes NLC (Non-Linearity Compensation) correction tables, visualizes results.
 
 ## Hardware
 
@@ -24,12 +24,43 @@ Single-shaft fixture — both encoders and the stepper on the same shaft. Magnet
 | DC removal | chip subtracts the mean automatically |
 | NLC range | ±0.044° per point (±32 LSB) |
 
-## Quick Start
+## Quick Start — Python GUI
 
-```
+```bash
+cd software
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 python main.py
 ```
+
+## Quick Start — Firmware
+
+### Prerequisites
+
+- [ARM GNU Toolchain](https://developer.arm.com/downloads/-/arm-gnu-toolchain-downloads) (`arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi`)
+- CMake ≥ 3.22
+- Ninja (or another CMake generator)
+
+### Build
+
+```bash
+cd firmware/MT6835_EVAL_STM32H503
+cmake --preset=Debug
+cmake --build --preset=Debug
+```
+
+Output: `build/Debug/MT6835_EVAL_01.elf` (and `.bin`, `.hex`).
+
+### Flash
+
+Via ST-Link (OpenOCD, STM32CubeProgrammer, or `st-flash`):
+
+```bash
+st-flash write build/Debug/MT6835_EVAL_01.bin 0x08000000
+```
+
+Or load the `.elf` directly from IDE (STM32CubeIDE, VS Code + Cortex-Debug).
 
 ## Workflow
 
@@ -41,17 +72,20 @@ python main.py
 6. **Upload NLC** — writes table to MT6835 registers + EEPROM
 7. **Collect Data** again to verify improvement
 
-
-## Project structure in root directory
+## Project structure
 
 ```
-software/       — Python GUI (PyQt5) + calibration logic
-firmware/       — STM32 firmware (STM32CubeIDE, C)
-data/           — collected CSV data (gitignored)
-data/nlc/       — generated NLC hex files (gitignored)
-construction/   — mechanical CAD
-docs/           — technical report, datasheets
+software/         — Python GUI (PyQt5) + calibration logic
+firmware/         — STM32 firmware (CMake, C)
+data/             — collected CSV data (gitignored)
+  nlc/            — generated NLC hex files (gitignored)
+construction/     — mechanical STEP files (see note below)
+docs/             — technical report, datasheets
 ```
+
+### Construction files
+
+The `construction/` folder contains individual STEP files for each 3D printed part — **no assembly file is provided**. These are reference geometry only.
 
 ## License
 
