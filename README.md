@@ -60,7 +60,7 @@ Via ST-Link (OpenOCD, STM32CubeProgrammer, or `st-flash`):
 st-flash write build/Debug/MT6835_EVAL_01.bin 0x08000000
 ```
 
-Or load the `.elf` directly from IDE (STM32CubeIDE, VS Code + Cortex-Debug).
+Or load the `.elf` directly from IDE (STM32CubeIDE, VS Code + Cortex-Debug), or with CubeProgrammer.
 
 ## Workflow
 
