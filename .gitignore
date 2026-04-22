@@ -1,4 +1,4 @@
-# Data (collected measurements, generated NLC tables)
+# Data
 data/*.csv
 data/nlc/*.csv
 data/nlc/*.hex
@@ -15,28 +15,25 @@ docs/
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
 .venv/
 venv/
 env/
 .env
 pyproject.toml
 
-# IDE / editor
+# IDE
 .vscode/
-.idea/
 *.swp
 *.swo
 *~
 .clangd/
 .clangd
-compile_commands.json
 
 # OS
 Thumbs.db
 .DS_Store
 
-# STM32 firmware build
+# STM32 firmware
 firmware/**/build/
 firmware/**/Debug/
 firmware/**/Release/
